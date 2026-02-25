@@ -64,7 +64,7 @@ Qdrant   ParentStore   DocumentIndex
 - 好处：降低上下文噪声，避免 metadata 干扰推理。
 - 好处：引用展示与问答解耦，UI 可独立优化 citation 呈现。
 
-### 2) 多知识库一等公民
+### 2) 多知识库隔离
 - 每个接口显式带 `kb_id`。
 - 默认单库检索，避免跨领域语义污染。
 
@@ -168,14 +168,6 @@ project/
   document_chunker.py      # 文档切分
   docker/start_api_ollama.sh
 ```
-
-## 面试可展开的技术点
-
-- 为什么把 `retrieve` 与 `resolve_refs` 拆成两步？
-- 为什么多 KB 必须在 API 层显式化，而不是仅靠 prompt 限制？
-- 如何权衡召回质量（top_k/阈值/filter）与上下文成本？
-- 异步任务与同步接口在用户体验和系统吞吐上的取舍。
-- 工具权限最小化（只读 vs 写操作）如何降低 agent 误操作风险。
 
 ## 后续规划
 
