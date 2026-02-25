@@ -1,110 +1,133 @@
 # Agentic RAG Service
 
-一个面向 Agent 生态的 RAG 系统项目。我把早期的 Agentic RAG 原型（多步检索推理）工程化为可部署的 HTTP 服务，并完成了与 OpenClaw 的工具化集成。
+![OpenClaw integrated with RAG Service](./image.png)
 
-这个仓库用于展示我在以下方面的完整能力：
-- RAG 架构设计与迭代
-- 检索质量与引用可解释性
-- API 工程化与异步任务化
-- Agent Tool 集成与落地部署
+演示视频：[`点击观看`](https://www.bilibili.com/video/BV131f4BCEdM/?spm_id_from=333.1387.upload.video_card.click&vd_source=ea2e425b8f3061b1a7884cf3620c1d62)
 
-## 项目定位
+该界面已接入本项目 RAG Service，支持：
+- 拖拽 PDF/Markdown 入库（异步任务化）
+- 多知识库（KB）切换与问答
+- 检索问答与引用追溯（`retrieve + ask + resolve_refs`）
+- 文档管理与索引维护（列表、删除、重建）
 
-目标不是“能跑的 Demo”，而是一个可持续演进的 Agent-ready RAG 基础设施：
-- 多知识库隔离（`kb_id`）
-- 可控检索上下文（减少 metadata 污染）
-- 可追溯引用（citation 延迟绑定）
-- 稳定 API 契约（方便 OpenClaw/其他 agent 接入）
+Agentic RAG Service 是一个面向 Agent 场景的 RAG 引擎：从文档切分、混合检索、证据约束回答到引用解析，形成完整的检索问答闭环。项目支持多知识库、异步入库，并提供稳定的 API 契约，可快速接入 OpenClaw 等工具调用框架。
 
-## 我做了什么（核心工作）
+## RAG 核心能力
 
-1. Agentic RAG 原型能力（前期）
-- 完成文档切分、向量检索、父子块回溯等基础能力。
-- 验证“检索-推理-回答”闭环，并沉淀为可复用流程。
+### 1) 分层切分（Parent/Child）
 
-2. 服务化改造（当前仓库主线）
-- 将原型改造为 FastAPI 服务，统一鉴权与错误码。
-- 引入异步任务（入库/重建索引），通过 `task_id` 追踪状态。
-- 完成多 KB 数据隔离与文献级过滤（`source_names`）。
+文档入库不是单层 chunk，而是两层结构：
 
-3. 引用体系重构（关键设计）
-- `retrieve` 只返回 `ref_id + chunk_text (+score)`，不把大段 metadata 注入 LLM。
-- `ask` 输出 `answer + used_refs`。
-- `resolve_refs` 单独做 citation 解析，返回 `source_name/document_id/page_hint/snippet`。
+- Parent chunk：按 Markdown 标题切分后，再做“合并过小块 + 拆分过大块 + 清理尾小块”
+- Child chunk：在 Parent 基础上做细粒度递归切分（用于向量检索）
 
-4. OpenClaw 工具集成
-- 对接 `rag_*` 工具调用契约，支持建库、导入、检索、问答、删除、重建。
-- 适配 Agent 调用场景，区分读操作和写操作权限边界。
+这样做的目的：
+- 检索阶段用 Child 提高召回精度
+- 回溯阶段保留 Parent 级语义完整性与可读性
 
-## 架构概览
+当前关键参数（可调）：
+- `CHILD_CHUNK_SIZE=500`
+- `CHILD_CHUNK_OVERLAP=100`
+- `MIN_PARENT_SIZE=2000`
+- `MAX_PARENT_SIZE=4000`
 
-```text
-OpenClaw UI / Agent Tools
-          |
-          v
-  FastAPI API Layer (api_server.py)
-          |
-          v
-        RagService
-   /         |            \
-Qdrant   ParentStore   DocumentIndex
-```
+### 2) 混合检索（Hybrid Retrieval）
 
-核心问答链路：
+检索层使用 Qdrant Hybrid 模式：
 
-1. `POST /v1/kb/{kb_id}/retrieve`
-2. 构造最小上下文（仅 `ref_id + chunk_text`）
-3. LLM 生成 `answer + used_refs`
-4. `POST /v1/kb/{kb_id}/resolve_refs`
-5. 返回 `answer + citations (+debug)`
+- Dense：`sentence-transformers/all-mpnet-base-v2`
+- Sparse：`Qdrant/bm25`
 
-## 关键设计决策
+检索策略包括：
+- `score_threshold` 门限控制
+- `source_names` 文献级过滤
+- 过滤场景下自动扩大候选池（`top_k * 5`，上限 200），降低误过滤造成的召回损失
+- 多级 fallback（带分数检索失败时回退到无分数检索）
 
-### 1) Two-stage RAG + Delayed Citation Binding
-- 好处：降低上下文噪声，避免 metadata 干扰推理。
-- 好处：引用展示与问答解耦，UI 可独立优化 citation 呈现。
+### 3) `ask`：证据约束回答（核心亮点）
 
-### 2) 多知识库隔离
-- 每个接口显式带 `kb_id`。
-- 默认单库检索，避免跨领域语义污染。
+`ask` 不是“把检索结果拼给 LLM”的普通模式，而是受证据约束的回答流程：
 
-### 3) 异步任务化
-- 入库/重建索引作为后台任务执行，前台仅拿 `task_id`。
-- 任务状态：`queued/running/completed/failed/skipped`。
+1. 先执行 `retrieve` 得到候选 `ref_id + chunk_text`
+2. 将“允许引用的 ref_id 列表”与上下文一起给 LLM
+3. 强约束 LLM 输出结构化结果：`answer + used_refs`
+4. 服务端校验 `used_refs`，仅保留候选集合中的合法引用
+5. 再将 `used_refs` 解析为 citations 返回
 
-### 4) 面向工具调用的 API 契约
-- 请求/响应结构稳定，适配 Tool Calling。
-- 错误返回统一结构，便于 agent 做重试与兜底。
+这意味着：
+- 模型回答与证据显式绑定
+- 非法引用会被服务端过滤
+- 无命中时返回保守回答（而不是强行编造）
 
-## 技术栈
+### 4) 延迟引用绑定（Delayed Citation Binding）
 
-- Python 3.13
-- FastAPI + Uvicorn
-- Qdrant（向量检索）
-- Ollama（本地 LLM）
-- LangChain（模型调用封装）
-- Docker（单容器 API+Ollama 部署）
+系统将“回答生成”和“引用展示”解耦：
 
-## 主要接口
+- 检索/问答阶段只使用最小上下文
+- 展示阶段才调用 `resolve_refs` 解析 `source_name/document_id/parent_id/page_hint/snippet`
 
-- `GET /healthz`
-- `GET /v1/kb`
-- `POST /v1/kb/{kb_id}`
-- `POST /v1/kb/{kb_id}/documents`
-- `GET /v1/tasks/{task_id}`
-- `GET /v1/kb/{kb_id}/documents`
-- `DELETE /v1/kb/{kb_id}/documents/{document_id}`
-- `POST /v1/kb/{kb_id}/retrieve`
-- `POST /v1/kb/{kb_id}/resolve_refs`
-- `POST /v1/kb/{kb_id}/ask`
-- `POST /v1/kb/{kb_id}/reindex`
-- `POST /v1/kb/{kb_id}/clear`
+收益：
+- 减少 metadata 对 LLM 的污染
+- 引用链条可审计、可追溯、可单独优化
 
-详细请求示例见：[project/API_README.md](/home/test/workspace/agentic_rag_service/project/API_README.md)
+### 5) 多知识库隔离
 
-## 快速开始
+- 所有核心操作显式携带 `kb_id`
+- 每个 KB 独立 collection、文档目录、父块存储与索引元数据
+- 支持在 KB 内继续按 `source_names` 精细化限制检索范围
 
-### 方式 A：本地启动
+## 端到端 RAG 流程
+
+### 入库流程
+
+1. 上传来源：`file_path` / `base64_file` / `text`
+2. PDF 转 Markdown（或直接使用 Markdown）
+3. Parent/Child 分层切分
+4. Child 写入 Qdrant，Parent 写入本地 ParentStore
+5. 文档元信息写入 DocumentIndex
+
+### 问答流程
+
+1. `retrieve(query)` 返回候选片段
+2. `ask(question)` 在受限证据集上生成 `answer + used_refs`
+3. `resolve_refs(used_refs)` 解析可展示 citations
+4. 返回答案、引用和调试统计
+
+## 与普通 RAG 的关键差异
+
+- 不是“仅返回相似片段”，而是“证据约束生成 + 引用校验”
+- 不是“metadata 全量入模”，而是“最小上下文 + 延迟引用解析”
+- 不是“单库混放”，而是“多 KB 一等公民 + 文献级过滤”
+- 不是“同步阻塞入库”，而是“异步任务化索引流程”
+
+## 集成与调用体验（OpenClaw / Tool Calling）
+
+这个项目的设计目标之一是“低成本集成”：外部系统无需耦合内部检索实现，只需按 HTTP 接口调用即可完成建库、入库、检索、问答、引用解析、重建索引等全流程。
+
+在 OpenClaw 中可直接映射为工具集：
+
+- 库与文档：`rag_list_kb`、`rag_create_kb`、`rag_list_documents`
+- 入库与维护：`rag_ingest`、`rag_ingest_local_file`、`rag_reindex`、`rag_delete_document`
+- 检索问答：`rag_retrieve`、`rag_ask`
+- 任务与引用：`rag_task_status`、`rag_resolve_refs`
+
+这使得 Agent 可以在一个统一工作流中完成：上传文献 -> 检索证据 -> 生成回答 -> 回溯引用，而无需额外胶水层。
+
+## 主要接口（简要）
+
+- `POST /v1/kb/{kb_id}/documents`：异步入库
+- `GET /v1/tasks/{task_id}`：任务状态
+- `POST /v1/kb/{kb_id}/retrieve`：检索
+- `POST /v1/kb/{kb_id}/ask`：证据约束问答
+- `POST /v1/kb/{kb_id}/resolve_refs`：引用解析
+- `POST /v1/kb/{kb_id}/reindex`：重建索引
+- `GET /v1/kb/{kb_id}/documents`：文档列表
+
+更多示例见 `project/API_README.md`。
+
+## 快速启动
+
+### 本地
 
 ```bash
 cd project
@@ -112,18 +135,19 @@ export RAG_API_TOKEN="replace-with-strong-token"
 python3 api_server.py
 ```
 
-默认：`http://127.0.0.1:8099`
+默认地址：`http://127.0.0.1:8099`
 
-### 方式 B：Docker（推荐演示）
+### Docker（API + Ollama）
 
 ```bash
 cd /home/test/workspace/agentic_rag_service
 docker build -f Dockerfile.api-ollama -t rag-api-ollama:local .
 
-docker run -d --name rag-api-ollama \
+docker run -d --name rag-api-ollama --restart unless-stopped \
+  --gpus all \
   -p 8099:8099 \
-  -e RAG_API_TOKEN="rag-dev-token-123" \
-  -e RAG_DATA_ROOT="/data" \
+  -e RAG_API_TOKEN=rag-dev-token-123 \
+  -e RAG_DATA_ROOT=/data \
   -v /home/test/workspace/agentic_rag_service/.data:/data \
   rag-api-ollama:local
 ```
@@ -135,46 +159,27 @@ curl -sS http://127.0.0.1:8099/healthz \
   -H "Authorization: Bearer rag-dev-token-123"
 ```
 
-## 环境变量
+## 关键可调参数（RAG 调优）
 
-- `RAG_API_TOKEN`：API 鉴权 token
-- `RAG_API_HOST` / `RAG_API_PORT`：服务监听地址
-- `RAG_DATA_ROOT`：数据根目录（索引、任务、文档）
-- `RAG_DEFAULT_KB_ID`：默认知识库
-- `OLLAMA_BASE_URL`：LLM 服务地址
-- `RAG_OLLAMA_MODEL`：启动时模型名
-- `OLLAMA_PULL_ON_START`：是否启动时拉模型（`1/0`）
+- 召回范围：`top_k`
+- 召回阈值：`score_threshold`
+- 上下文片段数：`max_context_parents`
+- 文献过滤：`source_names`
+- Chunk 策略：`CHILD_CHUNK_SIZE / OVERLAP / MIN_PARENT_SIZE / MAX_PARENT_SIZE`
 
-## 与 OpenClaw 集成（实践）
-
-我在 OpenClaw 侧按工具插件方式接入该服务，常用工具包括：
-- 读能力：`rag_retrieve`、`rag_ask`、`rag_list_documents`、`rag_list_kb`
-- 写能力：`rag_create_kb`、`rag_ingest`、`rag_delete_document`、`rag_reindex`
-- 任务与引用：`rag_task_status`、`rag_resolve_refs`
-
-实践经验：
-- 将读写工具做权限分离，减少误操作。
-- 将 citation 解析交给 `resolve_refs`，避免 LLM 幻觉引用。
-
-## 仓库结构（精简后）
+## 项目结构
 
 ```text
 project/
-  api_server.py            # FastAPI 入口
+  document_chunker.py      # 分层切分策略
+  services/rag_service.py  # 检索、ask、引用解析主链路
+  services/task_manager.py # 异步任务队列
+  db/vector_db_manager.py  # Qdrant Hybrid 检索
+  db/parent_store_manager.py
+  db/document_index_manager.py
+  api_server.py            # HTTP 服务入口
   api/schemas.py           # 请求模型
-  services/rag_service.py  # 核心业务逻辑
-  services/task_manager.py # 异步任务管理
-  db/                      # 向量库/索引/父块存储
-  document_chunker.py      # 文档切分
-  docker/start_api_ollama.sh
 ```
-
-## 后续规划
-
-- 引入 rerank（cross-encoder）提升高相似噪声场景精度
-- 增加离线评测（Recall@K、Citation Hit Rate）
-- 增加流式响应与任务事件推送（WebSocket）
-- 增加多租户与访问策略控制
 
 ## License
 
