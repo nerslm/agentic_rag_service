@@ -1,0 +1,33 @@
+FROM python:3.13
+
+ENV PYTHONUNBUFFERED=1
+ENV RAG_API_HOST=0.0.0.0
+ENV RAG_API_PORT=8099
+ENV RAG_API_TOKEN=change-me
+ENV RAG_DATA_ROOT=/data
+ENV OLLAMA_PORT=11434
+ENV OLLAMA_BASE_URL=http://127.0.0.1:11434
+ENV RAG_OLLAMA_MODEL=qwen3:4b-instruct-2507-q4_K_M
+ENV OLLAMA_PULL_ON_START=1
+
+RUN apt-get update && apt-get install -y \
+    curl \
+    ca-certificates \
+    zstd \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://ollama.com/install.sh | sh
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade -r requirements.txt
+
+COPY project ./project
+
+RUN chmod +x /app/project/docker/start_api_ollama.sh
+RUN mkdir -p /data
+
+EXPOSE 8099
+
+CMD ["/app/project/docker/start_api_ollama.sh"]

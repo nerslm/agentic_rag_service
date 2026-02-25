@@ -1,0 +1,16 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.ipynb
+assets
+project/__pycache__
+project/*/__pycache__
+project/markdown_docs
+project/markdown_docs_kb
+project/parent_store
+project/parent_store_kb
+project/qdrant_db
+project/task_store
+project/document_index.json
+node_modules
